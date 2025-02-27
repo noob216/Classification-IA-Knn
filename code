@@ -1,0 +1,153 @@
+import pandas as pd
+import numpy as np
+from itertools import combinations_with_replacement
+from collections import Counter
+from scipy.spatial import distance
+
+# Charger les données
+train_data = pd.read_csv('train.csv')
+test_data = pd.read_csv('test.csv')
+
+X_train = train_data.iloc[:, 1:8].values
+y_train = train_data['Label'].values
+X_test = test_data.iloc[:, 1:8].values
+
+# Normalisation standard optimisée
+def standard_scaler(X):
+    mean = X.mean(axis=0)
+    std = X.std(axis=0)
+    std[std == 0] = 1  # Éviter la division par zéro
+    return (X - mean) / std, mean, std
+
+# Interactions polynomiales limitées
+def polynomial_features(X, degree=2, cross_terms=True):
+    if cross_terms:
+        comb = list(combinations_with_replacement(range(X.shape[1]), degree))
+        X_poly = np.hstack([np.prod(X[:, c], axis=1, keepdims=True) for c in comb])
+    else:
+        X_poly = X ** degree
+    return X_poly
+
+# Borderline-SMOTE simplifié
+def borderline_smote(X, y, k=5, perturbation_factor=0.02, random_state=42):
+    np.random.seed(random_state)
+    classes, class_counts = np.unique(y, return_counts=True)
+    max_count = max(class_counts)
+    X_resampled, y_resampled = [X[y == cls] for cls in classes], [y[y == cls] for cls in classes]
+
+    for cls, X_class in zip(classes, X_resampled):
+        if len(X_class) < max_count:
+            diff = max_count - len(X_class)
+            # Trouver les plus proches voisins de la classe minoritaire
+            neighbors = distance.cdist(X_class, X, metric='cityblock').argsort(axis=1)[:, 1:k + 1]
+            borderline_mask = np.any(y[neighbors] != cls, axis=1)  # Frontières des classes
+            borderline_samples = X_class[borderline_mask]
+
+            if len(borderline_samples) > 0:
+                synthetic_samples = []
+                for _ in range(diff):
+                    idx = np.random.choice(len(borderline_samples))
+                    neighbors_idx = np.random.choice(k)
+                    synthetic_sample = borderline_samples[idx] + perturbation_factor * (
+                        X[neighbors[idx, neighbors_idx]] - borderline_samples[idx])
+                    synthetic_samples.append(synthetic_sample)
+                X_resampled.append(np.vstack(synthetic_samples))
+                y_resampled.append(np.full(diff, cls))
+
+    return np.vstack(X_resampled), np.hstack(y_resampled)
+
+# Implémentation optimisée de KNN
+class KNNClassifier:
+    def __init__(self, n_neighbors=5, weights='uniform', metric='cityblock'):
+        self.n_neighbors = n_neighbors
+        self.weights = weights
+        self.metric = metric
+
+    def fit(self, X, y):
+        self.X_train = X
+        self.y_train = y
+
+    def _compute_distances(self, X_train, x):
+        return distance.cdist([x], X_train, metric=self.metric).flatten()
+
+    def predict(self, X):
+        predictions = []
+        for x in X:
+            distances = self._compute_distances(self.X_train, x)
+            nearest_indices = np.argpartition(distances, self.n_neighbors)[:self.n_neighbors]
+            nearest_labels = self.y_train[nearest_indices]
+
+            if self.weights == 'uniform':
+                prediction = Counter(nearest_labels).most_common(1)[0][0]
+            else:  # weights == 'distance'
+                weights = 1 / (distances[nearest_indices] + 1e-10)
+                weighted_counts = Counter()
+                for label, weight in zip(nearest_labels, weights):
+                    weighted_counts[label] += weight
+                prediction = weighted_counts.most_common(1)[0][0]
+
+            predictions.append(prediction)
+        return np.array(predictions)
+
+# Pipeline personnalisé ajusté
+class CustomPipeline:
+    def __init__(self, steps):
+        self.steps = steps
+
+    def fit_transform(self, X, y=None):
+        for name, step in self.steps:
+            if callable(step):
+                X = step(X)
+        return X
+
+    def transform(self, X):
+        for name, step in self.steps:
+            if callable(step):
+                X = step(X)
+        return X
+
+# Étapes du pipeline
+pipeline_steps = [
+    ('poly', lambda X: polynomial_features(X, degree=2, cross_terms=True)),
+    ('scaler', lambda X: standard_scaler(X)[0]),
+]
+
+pipeline = CustomPipeline(pipeline_steps)
+
+# Transformation des données
+X_train_transformed = pipeline.fit_transform(X_train)
+X_test_transformed = pipeline.transform(X_test)
+
+# Application de Borderline-SMOTE ajusté
+X_train_balanced, y_train_balanced = borderline_smote(X_train_transformed, y_train, k=5, perturbation_factor=0.02)
+
+# Recherche d'hyperparamètres élargie
+best_params = {}
+best_accuracy = 0
+
+for n_neighbors in range(1, 25):  # Étendre la recherche de voisins
+    for weights in ['uniform', 'distance']:
+        knn = KNNClassifier(n_neighbors=n_neighbors, weights=weights, metric='cityblock')
+        knn.fit(X_train_balanced, y_train_balanced)
+        y_train_pred = knn.predict(X_train_balanced)
+        accuracy = np.mean(y_train_pred == y_train_balanced)
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_params = {'n_neighbors': n_neighbors, 'weights': weights}
+
+print(f"Meilleurs paramètres : {best_params}")
+
+# Modèle optimisé
+optimized_knn = KNNClassifier(**best_params)
+optimized_knn.fit(X_train_balanced, y_train_balanced)
+
+# Prédictions sur le test
+predictions = optimized_knn.predict(X_test_transformed)
+
+# Sauvegarde des résultats
+results = pd.DataFrame({
+    'Id': test_data['Id'],
+    'Label': predictions
+})
+results.to_csv('resultats_final_tuned_v6_borderline_smote.csv', index=False)
+print("Les résultats ajustés avec Borderline-SMOTE ont été sauvegardés dans 'resultats_final_tuned_v6_borderline_smote.csv'.")
